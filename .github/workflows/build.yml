@@ -69,7 +69,7 @@ jobs:
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$INPUT_RELEASE_ID" --jq '
             select(.draft==true) | .assets[] | select(.name=="input.enc") | .id')
           [[ "$id" =~ ^[0-9]+$ ]]
-          gh api -H 'Accept: application/octet-stream' +            "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$d/input.enc"
+          gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$d/input.enc"
           printf '%s  %s\n' "$INPUT_SHA256" "$d/input.enc" | sha256sum --check --status
           node scripts/envelope.mjs decrypt "$d/input.enc" "$d/input.zip"
           python scripts/stage.py "$d/input.zip" "$d/src"
@@ -111,7 +111,7 @@ jobs:
           trap 'rm -f "$d/original.keystore"' EXIT
           printf '%s' "$JLZ_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$d/original.keystore"
           signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
-          "$signer" sign --ks "$d/original.keystore" --ks-key-alias androiddebugkey +            --ks-pass pass:android --key-pass pass:android "$d/result/candidate.apk"
+          "$signer" sign --ks "$d/original.keystore" --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android "$d/result/candidate.apk"
           "$signer" verify --verbose --print-certs "$d/result/candidate.apk" > "$d/result/signature.txt"
           grep -Fq a129340ee73c5ef1d05808258582a83dfa53d4191e0bd49b5516ef083f3e5ef5 "$d/result/signature.txt"
           echo 'Original certificate verified.'
