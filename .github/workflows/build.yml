@@ -1,0 +1,133 @@
+name: Encrypted Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_release_id:
+        description: Draft release containing the sealed build input
+        required: true
+        type: string
+      input_sha256:
+        description: SHA-256 of the sealed input
+        required: true
+        type: string
+      recipient_public_key:
+        description: Base64 DER public key for the result
+        required: true
+        type: string
+      signing:
+        description: Use the original release certificate
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref_name == github.event.repository.default_branch && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+          cache-disabled: true
+      - name: Open authenticated build input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_ID: ${{ inputs.input_release_id }}
+          INPUT_SHA256: ${{ inputs.input_sha256 }}
+          WB_PRIVATE_BUILD_KEY: ${{ secrets.WB_INPUT_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$INPUT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          umask 077
+          d="$RUNNER_TEMP/android-work"
+          mkdir -p "$d/src" "$d/result"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$INPUT_RELEASE_ID" --jq '
+            select(.draft==true) | .assets[] | select(.name=="input.enc") | .id')
+          [[ "$id" =~ ^[0-9]+$ ]]
+          gh api -H 'Accept: application/octet-stream' +            "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$d/input.enc"
+          printf '%s  %s\n' "$INPUT_SHA256" "$d/input.enc" | sha256sum --check --status
+          node scripts/envelope.mjs decrypt "$d/input.enc" "$d/input.zip"
+          python scripts/stage.py "$d/input.zip" "$d/src"
+          rm -f "$d/input.enc" "$d/input.zip"
+      - name: Verify and compile Android
+        id: compile
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/android-work"
+          if ! (
+            cd "$d/src"
+            if test -f between-worlds-prod/package-lock.json; then
+              npm ci --prefix between-worlds-prod --no-audit --no-fund
+            else
+              npm install --prefix between-worlds-prod --no-audit --no-fund
+            fi
+            npm run build --prefix between-worlds-prod
+            mkdir -p native-android/app/src/main/assets/world-between
+            cp -R between-worlds-prod/dist/. native-android/app/src/main/assets/world-between/
+            cd native-android
+            gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --console=plain
+          ) > "$d/result/build.log" 2>&1; then
+            echo 'Compilation or checks failed. See the encrypted diagnostic artifact.' >&2
+            exit 1
+          fi
+          python scripts/verify-assets.py "$d/src" > "$d/result/asset-verification.json"
+          cp "$d/src/build-input.json" "$d/result/build-input.json"
+          cp "$d/src/native-android/app/build/outputs/apk/debug/app-debug.apk" "$d/result/candidate.apk"
+          echo 'Android tests, lint, compile, and required asset byte verification passed.'
+      - name: Apply and verify the original certificate
+        if: inputs.signing
+        env:
+          JLZ_DEBUG_KEYSTORE_BASE64: ${{ secrets.JLZ_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/android-work"
+          test -n "${JLZ_DEBUG_KEYSTORE_BASE64:-}"
+          trap 'rm -f "$d/original.keystore"' EXIT
+          printf '%s' "$JLZ_DEBUG_KEYSTORE_BASE64" | base64 --decode > "$d/original.keystore"
+          signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          "$signer" sign --ks "$d/original.keystore" --ks-key-alias androiddebugkey +            --ks-pass pass:android --key-pass pass:android "$d/result/candidate.apk"
+          "$signer" verify --verbose --print-certs "$d/result/candidate.apk" > "$d/result/signature.txt"
+          grep -Fq a129340ee73c5ef1d05808258582a83dfa53d4191e0bd49b5516ef083f3e5ef5 "$d/result/signature.txt"
+          echo 'Original certificate verified.'
+      - name: Seal result for the owner
+        if: always() && steps.compile.outcome != 'skipped'
+        env:
+          WB_PRIVATE_RECIPIENT_KEY: ${{ inputs.recipient_public_key }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/android-work"
+          test -n "${WB_PRIVATE_RECIPIENT_KEY:-}"
+          python -c 'import shutil,sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2])' "$d/result" "$d/result"
+          node scripts/envelope.mjs encrypt "$d/result.zip" android-build-result.enc
+      - name: Publish encrypted result
+        if: always() && steps.compile.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-result-encrypted
+          path: android-build-result.enc
+          if-no-files-found: error
+          retention-days: 2
