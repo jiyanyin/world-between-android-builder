@@ -79,7 +79,9 @@ jobs:
         run: |
           set -euo pipefail
           d="$RUNNER_TEMP/android-work"
-          if ! (
+          result=0
+          bash -e -s -- "$d" > "$d/result/build.log" 2>&1 <<'BUILD' || result=$?
+            d="$1"
             cd "$d/src"
             if test -f between-worlds-prod/package-lock.json; then
               npm ci --prefix between-worlds-prod --no-audit --no-fund
@@ -91,7 +93,13 @@ jobs:
             cp -R between-worlds-prod/dist/. native-android/app/src/main/assets/world-between/
             cd native-android
             gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --console=plain
-          ) > "$d/result/build.log" 2>&1; then
+          BUILD
+          reports="$d/src/native-android/app/build/test-results/testDebugUnitTest"
+          if test -d "$reports"; then
+            mkdir "$d/result/unit-tests"
+            find "$reports" -maxdepth 1 -type f -name 'TEST-*.xml' -exec cp -t "$d/result/unit-tests" -- {} +
+          fi
+          if (( result != 0 )); then
             echo 'Compilation or checks failed. See the encrypted diagnostic artifact.' >&2
             exit 1
           fi
