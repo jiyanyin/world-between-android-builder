@@ -92,7 +92,20 @@ jobs:
             mkdir -p native-android/app/src/main/assets/world-between
             cp -R between-worlds-prod/dist/. native-android/app/src/main/assets/world-between/
             cd native-android
-            gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --console=plain
+            for delay in 0 25 60; do
+              sleep "$delay"
+              gradle_log="$d/gradle-last.log"
+              gradle_status=0
+              gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --no-daemon --console=plain > "$gradle_log" 2>&1 || gradle_status=$?
+              cat "$gradle_log"
+              if (( gradle_status == 0 )); then
+                break
+              fi
+              if ! grep -Eq 'Could not (GET|HEAD).*repo\.maven\.apache\.org/.*Received status code (429|500|502|503|504)' "$gradle_log"; then
+                exit "$gradle_status"
+              fi
+            done
+            exit "$gradle_status"
           BUILD
           reports="$d/src/native-android/app/build/test-results/testDebugUnitTest"
           if test -d "$reports"; then
